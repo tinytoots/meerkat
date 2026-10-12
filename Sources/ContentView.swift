@@ -48,9 +48,9 @@ struct ContentView: View {
     @State private var phase: Double = 0
     @State private var now = Date()
 
-    /// Drag translations arrive cumulative from the gesture's start, but the
-    /// window moves by increments, so remember what we have already applied.
-    @State private var dragApplied: CGSize = .zero
+    /// Where the mouse was, in screen coordinates, at the last step of a drag
+    /// of the collapsed critter.
+    @State private var lastDragMouse: NSPoint?
 
     /// 12 fps is plenty for a sway and a blink, and costs nothing measurable.
     private let ticker = Timer.publish(every: 1.0 / 12.0, on: .main, in: .common)
@@ -88,14 +88,20 @@ struct ContentView: View {
             // A 3pt threshold keeps a click to expand from registering as a drag.
             .gesture(
                 DragGesture(minimumDistance: 3)
-                    .onChanged { value in
-                        let delta = CGSize(
-                            width: value.translation.width - dragApplied.width,
-                            height: value.translation.height - dragApplied.height)
-                        dragApplied = value.translation
-                        moveBy(delta)
+                    .onChanged { _ in
+                        // Screen coordinates, not the gesture's translation:
+                        // the gesture measures in the view's own space, which
+                        // moves with the window being dragged, so the window
+                        // trailed the cursor at about half speed. Screen y
+                        // grows upward and moveBy takes a drag-style delta
+                        // that grows downward, hence last - mouse.
+                        let mouse = NSEvent.mouseLocation
+                        if let last = lastDragMouse {
+                            moveBy(CGSize(width: mouse.x - last.x, height: last.y - mouse.y))
+                        }
+                        lastDragMouse = mouse
                     }
-                    .onEnded { _ in dragApplied = .zero }
+                    .onEnded { _ in lastDragMouse = nil }
             )
             .help("\(store.headline) — click to expand, drag to move")
     }
@@ -256,8 +262,7 @@ struct ContentView: View {
             Button("Refresh plan usage") { store.refreshUsage() }
         }
         Button(usageFetchDisabled ? "Turn on plan usage" : "Turn off plan usage") {
-            usageFetchDisabled.toggle()
-            store.refreshUsage()
+            store.setPlanUsage(enabled: usageFetchDisabled)
         }
         Button("Open plan usage on claude.ai") { NSWorkspace.shared.open(usageSettingsURL) }
         Button("Reveal state folder") {
@@ -388,17 +393,19 @@ struct UsageRow: View {
             GeometryReader { geo in
                 ZStack(alignment: .leading) {
                     Capsule().fill(Color.primary.opacity(0.10))
-                    Capsule()
-                        .fill(color)
-                        .frame(width: max(2, geo.size.width * CGFloat(fraction)))
+                    if !hasReset {
+                        Capsule()
+                            .fill(color)
+                            .frame(width: max(2, geo.size.width * CGFloat(fraction)))
+                    }
                 }
             }
             .frame(height: 4)
 
-            Text("\(Int(window.percent.rounded()))%")
+            Text(hasReset ? "—" : "\(Int(window.percent.rounded()))%")
                 .font(.system(size: 10.5, weight: .semibold))
                 .monospacedDigit()
-                .foregroundStyle(window.percent >= 90 ? color : .secondary)
+                .foregroundStyle(!hasReset && window.percent >= 90 ? color : .secondary)
                 .frame(width: 34, alignment: .trailing)
 
             Text(resetText)
@@ -412,10 +419,18 @@ struct UsageRow: View {
         .help(tooltip)
     }
 
+    /// The figure was read before this window's reset, so it is no longer the
+    /// current one -- a pre-reset 97% would be wrong in red. Show a dash until
+    /// a fresh look replaces it.
+    private var hasReset: Bool {
+        window.resetsAt.map { $0 <= now } ?? false
+    }
+
     /// When the window resets, the way claude.ai puts it: a time if that is
     /// later today, a weekday and time if not.
     private var resetText: String {
-        guard let resets = window.resetsAt, resets > now else { return "" }
+        if hasReset { return "reset" }
+        guard let resets = window.resetsAt else { return "" }
         let sameDay = Calendar.current.isDate(resets, inSameDayAs: now)
         return (sameDay ? UsageRow.timeOnly : UsageRow.dayAndTime).string(from: resets)
     }
@@ -445,17 +460,16 @@ struct UsageRow: View {
     }
 
     private var tooltip: String {
-        var lines = ["\(window.title): \(String(format: "%.1f", window.percent))% used"]
-        if let resets = window.resetsAt {
-            if resets > now {
-                lines.append(
-                    "resets \(UsageRow.dayAndTime.string(from: resets)), "
-                        + "in \(shortElapsed(since: now, now: resets))")
-            } else {
-                lines.append("reset time has passed")
-            }
+        guard let resets = window.resetsAt else {
+            return "\(window.title): \(String(format: "%.1f", window.percent))% used"
         }
-        return lines.joined(separator: "\n")
+        if hasReset {
+            return "\(window.title): reset \(UsageRow.dayAndTime.string(from: resets)); "
+                + "waiting for a fresh figure"
+        }
+        return "\(window.title): \(String(format: "%.1f", window.percent))% used\n"
+            + "resets \(UsageRow.dayAndTime.string(from: resets)), "
+            + "in \(shortElapsed(since: now, now: resets))"
     }
 }
 

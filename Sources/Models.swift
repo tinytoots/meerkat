@@ -215,21 +215,34 @@ struct UsageSnapshot: Equatable {
     ///                             resets_at: epoch seconds or ISO 8601}
     ///
     /// The per-model weeks ("Fable this week") exist only in limits[]. The
-    /// seven_day_<codename> keys beside them are not what claude.ai shows, and
-    /// Claude Code does not display them either, so they are left alone.
+    /// other seven_day_* keys beside them are not rows claude.ai shows, so they
+    /// are left out; check-usage.sh lists any that carry a figure.
+    ///
+    /// A row appears only with a figure the reply actually gave. The one
+    /// exception is a window the reply lists as null, which means it has not
+    /// started -- nothing used, no reset scheduled -- and claude.ai shows that
+    /// as 0%. Anything else unreadable is left out rather than shown as a
+    /// made-up number.
     init?(usageAPI json: [String: Any], captured: Date) {
         var found: [UsageWindow] = []
 
         for key in ["five_hour", "seven_day"] where json.keys.contains(key) {
-            // Present but null means the window has not started: nothing used
-            // yet and no reset scheduled, which claude.ai shows as 0%.
-            let entry = json[key] as? [String: Any]
+            let percent: Double
+            let resets: Date?
+            if json[key] is NSNull {
+                percent = 0
+                resets = nil
+            } else if let entry = json[key] as? [String: Any],
+                      let value = usageNumber(entry["utilization"]) {
+                percent = value
+                resets = usageDate(entry["resets_at"])
+            } else {
+                continue
+            }
             found.append(
                 UsageWindow(
-                    id: key,
-                    label: UsageWindow.label(for: key),
-                    percent: entry.flatMap { usageNumber($0["utilization"]) } ?? 0,
-                    resetsAt: entry.flatMap { usageDate($0["resets_at"]) }))
+                    id: key, label: UsageWindow.label(for: key), percent: percent,
+                    resetsAt: resets))
         }
 
         for case let limit as [String: Any] in (json["limits"] as? [Any]) ?? [] {
@@ -237,16 +250,14 @@ struct UsageSnapshot: Equatable {
                   let scope = limit["scope"] as? [String: Any],
                   let model = scope["model"] as? [String: Any],
                   let name = model["display_name"] as? String,
-                  !name.isEmpty
+                  !name.isEmpty,
+                  let percent = usageNumber(limit["percent"]) ?? usageNumber(limit["utilization"])
             else { continue }
             let id = "model:" + name.lowercased()
             guard !found.contains(where: { $0.id == id }) else { continue }
             found.append(
                 UsageWindow(
-                    id: id,
-                    label: name,
-                    percent: usageNumber(limit["percent"])
-                        ?? usageNumber(limit["utilization"]) ?? 0,
+                    id: id, label: name, percent: percent,
                     resetsAt: usageDate(limit["resets_at"])))
         }
 

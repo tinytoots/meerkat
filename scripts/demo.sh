@@ -16,7 +16,13 @@ mkdir -p "$DIR"
 USAGE="$HOME/.meerkat/usage.json"
 SAVED="$HOME/.meerkat/usage.json.demo-saved"
 
+CLEANED=0
 cleanup() {
+  # Once only. Ctrl-C runs this from the INT trap and then again from EXIT,
+  # and a second run would find nothing set aside and delete the real
+  # usage.json the first run had just put back.
+  [ "$CLEANED" = "1" ] && return
+  CLEANED=1
   rm -f "$DIR"/demo-*.json
   # Put back any real captured usage, or remove the demo figures entirely.
   if [ -f "$SAVED" ]; then
@@ -27,7 +33,8 @@ cleanup() {
     echo "demo cleared."
   fi
 }
-trap cleanup EXIT INT TERM
+trap 'cleanup; exit 130' INT TERM
+trap cleanup EXIT
 
 "$PY" - "$DIR" <<'PYEOF'
 import json, os, sys, time
@@ -105,16 +112,18 @@ cat <<'MSG'
 
 The widget should now show the full layout. Worth checking:
 
-  PLAN USAGE -- three bars, green/amber/red by how full they are. These
-  numbers are FAKE, written only so you can see the block; they vanish
-  when you press Return. Hover a bar for its reset countdown.
+  PLAN USAGE -- three bars, green/amber/red by how full they are. If
+  Meerkat has fetched your real figures from claude.ai in the last half
+  hour, those stay up and these FAKE ones (16/81/100%) never show; turn
+  plan usage off from the menu first to see them. Hover a bar for its
+  reset time.
 
   * The header meerkat wears the most urgent state, so it should be the
     "needs you" one: eyes wide, bobbing, orange ! above its head.
-  * api-server      -> orange dot, "needs permission"
-  * meerkat         -> amber pulsing dot, a 3/5 progress bar
-  * web-frontend    -> green dot, 4/4
-  * data-pipeline   -> red dot, "rate_limit"
+  * api-server      -> orange dot, "needs permission", "needs you · 14s"
+  * meerkat         -> amber pulsing dot, "3/5 · 2m" and a progress bar
+  * web-frontend    -> green tick, "done · 48s", a full progress bar
+  * data-pipeline   -> red dot, "rate_limit", "failed · 7m"
   * notes           -> grey dot, dozing
   * Click the meerkat to collapse to a puck; click it again to expand.
   * Drag it around, both collapsed and expanded.

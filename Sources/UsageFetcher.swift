@@ -74,11 +74,12 @@ enum UsageStatus: Equatable {
 ///
 /// The token is the sensitive part, so it is handled narrowly. It is read fresh
 /// for every request through /usr/bin/security -- the same tool, item and
-/// account Claude Code itself uses, which is why macOS does not prompt -- kept
-/// only for the length of that one request, and never logged or written
-/// anywhere. Meerkat never refreshes it, either: a refresh rotates the refresh
-/// token, which would quietly sign Claude Code out. An expired token just waits
-/// for Claude Code to renew it.
+/// account Claude Code itself uses, which is why macOS does not ask for
+/// permission -- kept only for the length of that one request, and never logged
+/// or written anywhere. A locked keychain is noticed first and skipped, the way
+/// Claude Code does it, so Meerkat never raises an unlock dialog. Meerkat never
+/// refreshes the token, either: a refresh rotates it, which would quietly sign
+/// Claude Code out. An expired token just waits for Claude Code to renew it.
 ///
 /// The endpoint is undocumented and may change shape; UsageSnapshot parses it
 /// defensively, and anything it cannot read surfaces as a status, not a crash.
@@ -105,6 +106,10 @@ final class UsageFetcher {
     /// Never ask more often than this, however many turns finish at once.
     private let minimumGap: TimeInterval = 45
 
+    /// After the keychain failed to answer at all -- most likely a dialog
+    /// someone else raised -- leave it alone for a good while.
+    private let keychainQuietPeriod: TimeInterval = 30 * 60
+
     /// Where the last attempt is recorded for scripts/check-usage.sh. Figures
     /// and status only; never the token.
     private let statusFile: URL
@@ -120,6 +125,9 @@ final class UsageFetcher {
     private var notBefore = Date.distantPast
     private var backoff: TimeInterval = 0
     private var lastGood: UsageSnapshot?
+    /// Windows the last reply carried that the bars do not show, for
+    /// check-usage.sh. Figures only.
+    private var lastUnshown: [String: Double] = [:]
     private var wakeObserver: NSObjectProtocol?
 
     init(stateDirectory: URL) {
@@ -168,18 +176,51 @@ final class UsageFetcher {
         schedule(after: max(2, wait))
     }
 
-    /// Look now: the menu's refresh, or the off switch being flipped.
+    /// The menu's refresh. A look already under way answers it, and keeps
+    /// any sooner look that is already pending.
     func refreshNow() {
+        guard !inFlight else { return }
         schedule(after: 0, replacingSooner: true)
+    }
+
+    /// The menu's off switch. Off takes effect at once: whatever is pending is
+    /// cancelled and whatever is in flight is dropped when it lands. On looks
+    /// straight away, unless the endpoint asked us to back off, which holds.
+    func setDisabled(_ off: Bool) {
+        UserDefaults.standard.set(off, forKey: Self.disabledKey)
+        if off {
+            pending?.cancel()
+            pending = nil
+            pendingAt = nil
+            lastGood = nil
+            lastUnshown = [:]
+            onUpdate?(nil, .disabled)
+            record(.disabled)
+        } else {
+            onUpdate?(nil, notBefore > Date() ? .rateLimited(until: notBefore) : .starting)
+            schedule(after: 0, replacingSooner: true)
+        }
+    }
+
+    private var isDisabled: Bool {
+        // UserDefaults is thread-safe, so the worker may ask too.
+        UserDefaults.standard.bool(forKey: Self.disabledKey)
     }
 
     // MARK: - Scheduling
 
     /// Arrange the next look. An already-pending look that is sooner is kept,
     /// unless `replacingSooner`; a back-off the server asked for always holds.
+    ///
+    /// Everything here runs on the wall clock -- pendingAt, notBefore and the
+    /// timer itself -- so a look that fell due while the Mac slept runs on
+    /// wake instead of waiting out the rest of its delay in awake time.
     private func schedule(after delay: TimeInterval, replacingSooner: Bool = false) {
-        let when = max(Date().addingTimeInterval(max(0, delay)), notBefore)
-        if !replacingSooner, let pendingAt = pendingAt, pendingAt <= when { return }
+        let now = Date()
+        let when = max(now.addingTimeInterval(max(0, delay)), notBefore)
+        if !replacingSooner, let pendingAt = pendingAt, pendingAt > now, pendingAt <= when {
+            return
+        }
 
         pending?.cancel()
         let item = DispatchWorkItem { [weak self] in
@@ -191,7 +232,7 @@ final class UsageFetcher {
         pending = item
         pendingAt = when
         DispatchQueue.main.asyncAfter(
-            deadline: .now() + max(0, when.timeIntervalSinceNow), execute: item)
+            wallDeadline: .now() + max(0, when.timeIntervalSinceNow), execute: item)
     }
 
     // MARK: - Fetching
@@ -200,8 +241,7 @@ final class UsageFetcher {
         // A look already under way will answer this one too.
         guard !inFlight else { return }
 
-        if UserDefaults.standard.bool(forKey: Self.disabledKey) {
-            lastGood = nil
+        if isDisabled {
             finish(nil, .disabled, retryAfter: interval)
             return
         }
@@ -211,33 +251,91 @@ final class UsageFetcher {
 
         worker.async { [weak self] in
             guard let self = self else { return }
-            switch self.readToken() {
-            case .failure(let status):
-                DispatchQueue.main.async {
+            let read = self.readToken()
+            DispatchQueue.main.async {
+                switch read {
+                case .failure(let status, let retry):
                     if status == .notSignedIn { self.lastGood = nil }
-                    // An expired token is renewed by Claude Code, not by us;
-                    // look again fairly soon so the bars come back promptly.
-                    self.finish(nil, status, retryAfter: status == .signInExpired ? 60 : self.interval)
+                    self.finish(nil, status, retryAfter: retry ?? self.interval)
+                case .success(let token):
+                    // Turned off while the keychain was being read: send nothing.
+                    if self.isDisabled {
+                        self.finish(nil, .disabled, retryAfter: self.interval)
+                    } else {
+                        self.request(with: token)
+                    }
                 }
-            case .success(let token):
-                self.request(with: token)
             }
         }
     }
 
     private enum TokenRead {
         case success(String)
-        case failure(UsageStatus)
+        /// With how long to wait before trying again, when that should differ
+        /// from the usual interval.
+        case failure(UsageStatus, retryAfter: TimeInterval?)
     }
 
     /// Reads the access token out of Claude Code's keychain item. Runs on the
-    /// worker queue: `security` can block on a locked keychain.
+    /// worker queue: `security` can block.
     private func readToken() -> TokenRead {
+        // Reading an item from a locked keychain makes `security` raise an
+        // unlock dialog, and every later look would raise it again. Ask first
+        // whether the keychain is locked, the way Claude Code does:
+        // show-keychain-info answers 36 for a locked keychain without any UI.
+        let lock = runSecurity(["show-keychain-info"])
+        if lock.status == 36 {
+            return .failure(.keychainLocked, retryAfter: nil)
+        }
+
+        let read = runSecurity([
+            "find-generic-password", "-a", keychainAccount(), "-w", "-s", keychainService,
+        ])
+        if read.killed {
+            // It sat there past the watchdog, which means something is waiting
+            // on a person. Do not keep summoning that.
+            return .failure(.unavailable("keychain did not answer"), retryAfter: keychainQuietPeriod)
+        }
+        switch read.status {
+        case 0:
+            break
+        case 44:  // errSecItemNotFound
+            return .failure(.notSignedIn, retryAfter: nil)
+        case 36:  // errSecInteractionNotAllowed: locked after all
+            return .failure(.keychainLocked, retryAfter: nil)
+        case 128:  // the user cancelled a dialog
+            return .failure(.unavailable("keychain access cancelled"), retryAfter: keychainQuietPeriod)
+        default:
+            return .failure(.unavailable("keychain error \(read.status)"), retryAfter: nil)
+        }
+
+        // The item holds JSON: {"claudeAiOauth": {"accessToken", "expiresAt",
+        // ...}}. An item without claudeAiOauth is an API-key sign-in, which has
+        // no plan and so no plan usage.
+        guard let object = try? JSONSerialization.jsonObject(with: read.output),
+              let json = object as? [String: Any],
+              let oauth = json["claudeAiOauth"] as? [String: Any],
+              let token = oauth["accessToken"] as? String,
+              !token.isEmpty
+        else { return .failure(.notSignedIn, retryAfter: nil) }
+
+        // expiresAt is epoch milliseconds. Sending a token we know is dead
+        // would only earn a 401. Look again fairly soon, so the bars come back
+        // promptly once Claude Code has renewed it.
+        if let expires = oauth["expiresAt"] as? NSNumber,
+           expires.doubleValue / 1000 < Date().timeIntervalSince1970 + 30 {
+            return .failure(.signInExpired, retryAfter: 60)
+        }
+        return .success(token)
+    }
+
+    /// Runs /usr/bin/security with a 10-second watchdog. Its stderr goes
+    /// nowhere: the only interesting thing it says there is an error we
+    /// already get as the exit status.
+    private func runSecurity(_ arguments: [String]) -> (status: Int32, output: Data, killed: Bool) {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-        process.arguments = [
-            "find-generic-password", "-a", keychainAccount(), "-w", "-s", keychainService,
-        ]
+        process.arguments = arguments
         let output = Pipe()
         process.standardOutput = output
         process.standardError = FileHandle.nullDevice
@@ -246,10 +344,9 @@ final class UsageFetcher {
         do {
             try process.run()
         } catch {
-            return .failure(.unavailable("cannot run security"))
+            return (-1, Data(), false)
         }
 
-        // Never wait on the keychain forever.
         let watchdog = DispatchWorkItem {
             if process.isRunning { process.terminate() }
         }
@@ -257,38 +354,7 @@ final class UsageFetcher {
         let data = output.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
         watchdog.cancel()
-
-        switch process.terminationStatus {
-        case 0:
-            break
-        case 44:  // errSecItemNotFound
-            return .failure(.notSignedIn)
-        case 36:  // errSecInteractionNotAllowed: the keychain is locked
-            return .failure(.keychainLocked)
-        default:
-            if process.terminationReason == .uncaughtSignal {
-                return .failure(.unavailable("keychain timed out"))
-            }
-            return .failure(.unavailable("keychain error \(process.terminationStatus)"))
-        }
-
-        // The item holds JSON: {"claudeAiOauth": {"accessToken", "expiresAt",
-        // ...}}. An item without claudeAiOauth is an API-key sign-in, which has
-        // no plan and so no plan usage.
-        guard let object = try? JSONSerialization.jsonObject(with: data),
-              let json = object as? [String: Any],
-              let oauth = json["claudeAiOauth"] as? [String: Any],
-              let token = oauth["accessToken"] as? String,
-              !token.isEmpty
-        else { return .failure(.notSignedIn) }
-
-        // expiresAt is epoch milliseconds. Sending a token we know is dead
-        // would only earn a 401.
-        if let expires = oauth["expiresAt"] as? NSNumber,
-           expires.doubleValue / 1000 < Date().timeIntervalSince1970 + 30 {
-            return .failure(.signInExpired)
-        }
-        return .success(token)
+        return (process.terminationStatus, data, process.terminationReason == .uncaughtSignal)
     }
 
     /// The keychain account Claude Code files its item under: your user name,
@@ -349,6 +415,7 @@ final class UsageFetcher {
             }
             backoff = 0
             lastGood = snapshot
+            lastUnshown = UsageFetcher.unshownWindows(in: json, shown: snapshot)
             finish(snapshot, .ok, retryAfter: interval)
 
         case 401:
@@ -377,9 +444,34 @@ final class UsageFetcher {
         retryAfter delay: TimeInterval, replacingSooner: Bool = false
     ) {
         inFlight = false
+        if isDisabled {
+            // Off, possibly flipped while this look was under way: whatever it
+            // found is dropped, and nothing more is scheduled until it is
+            // turned back on.
+            lastGood = nil
+            lastUnshown = [:]
+            onUpdate?(nil, .disabled)
+            record(.disabled)
+            return
+        }
         onUpdate?(snapshot, status)
         record(status)
         schedule(after: delay, replacingSooner: replacingSooner)
+    }
+
+    /// Top-level windows with a figure that the bars leave out, such as
+    /// seven_day_sonnet, so check-usage.sh can say they exist.
+    private static func unshownWindows(in json: [String: Any], shown: UsageSnapshot) -> [String: Double] {
+        let shownIDs = Set(shown.windows.map(\.id))
+        var unshown: [String: Double] = [:]
+        for (key, value) in json where !shownIDs.contains(key) {
+            if let entry = value as? [String: Any],
+               let number = entry["utilization"] as? NSNumber,
+               CFGetTypeID(number) != CFBooleanGetTypeID() {
+                unshown[key] = number.doubleValue
+            }
+        }
+        return unshown
     }
 
     /// Leaves a note of the last attempt for scripts/check-usage.sh, in the
@@ -403,6 +495,7 @@ final class UsageFetcher {
                 windows[window.id] = entry
             }
             note["windows"] = windows
+            if !lastUnshown.isEmpty { note["not_shown"] = lastUnshown }
         }
         let url = statusFile
         worker.async {

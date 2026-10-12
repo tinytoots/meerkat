@@ -13,6 +13,7 @@ final class PanelController {
     private var cancellables: Set<AnyCancellable> = []
 
     private static let originKey = "panelOrigin"
+    private static let topLeftKey = "panelTopLeft"
     private static let collapsedKey = "collapsed"
 
     init(store: SessionStore) {
@@ -52,6 +53,11 @@ final class PanelController {
         panel.level = .floating
         panel.becomesKeyOnlyIfNeeded = true
         panel.hidesOnDeactivate = false
+
+        // Meerkat is never the active app -- it is an accessory with a
+        // non-activating panel -- and AppKit hides tooltips for inactive apps
+        // by default, which would silence every hover detail.
+        panel.allowsToolTipsWhenApplicationIsInactive = true
 
         // Visible on whichever Space you are on, and not dragged along into a
         // full-screen app's own Space.
@@ -172,25 +178,31 @@ final class PanelController {
 
     // MARK: - Position
 
+    /// The top-left corner, because that is the corner resizing holds still:
+    /// saving the bottom-left made the window land higher or lower on the next
+    /// launch whenever the number of rows had changed.
     private func saveOrigin() {
-        let origin = panel.frame.origin
+        let frame = panel.frame
         UserDefaults.standard.set(
-            ["x": Double(origin.x), "y": Double(origin.y)], forKey: Self.originKey)
+            ["x": Double(frame.minX), "top": Double(frame.maxY)], forKey: Self.topLeftKey)
     }
 
     private func restoreOrigin() {
-        let saved = UserDefaults.standard.dictionary(forKey: Self.originKey)
-        if let saved = saved,
+        let defaults = UserDefaults.standard
+        if let saved = defaults.dictionary(forKey: Self.topLeftKey),
            let x = saved["x"] as? Double,
-           let y = saved["y"] as? Double {
+           let top = saved["top"] as? Double {
+            panel.setFrameTopLeftPoint(NSPoint(x: x, y: top))
+        } else if let saved = defaults.dictionary(forKey: Self.originKey),
+                  let x = saved["x"] as? Double,
+                  let y = saved["y"] as? Double {
+            // Saved by an older build, as the bottom-left corner.
             panel.setFrameOrigin(NSPoint(x: x, y: y))
         } else if let screen = NSScreen.main {
             // First launch: top-right, below the menu bar, where a sentry belongs.
             let visible = screen.visibleFrame
-            panel.setFrameOrigin(
-                NSPoint(
-                    x: visible.maxX - panel.frame.width - 22,
-                    y: visible.maxY - panel.frame.height - 14))
+            panel.setFrameTopLeftPoint(
+                NSPoint(x: visible.maxX - panel.frame.width - 22, y: visible.maxY - 14))
         }
         clampOnScreen()
     }

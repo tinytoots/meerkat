@@ -45,13 +45,13 @@ if ! "$PY" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)' 2>/
   exit 1
 fi
 
-if [ "$MODE" != "uninstall" ]; then
+# A dry run writes nothing at all, the live hook copy included.
+if [ "$MODE" = "install" ]; then
   mkdir -p "$MEERKAT_HOME/sessions"
   install -m 0755 "$HERE/hooks/meerkat-hook.py" "$MEERKAT_HOME/meerkat-hook.py"
   echo "hook   -> $MEERKAT_HOME/meerkat-hook.py"
+  mkdir -p "$(dirname "$SETTINGS")"
 fi
-
-mkdir -p "$(dirname "$SETTINGS")"
 
 MEERKAT_MODE="$MODE" \
 MEERKAT_PY="$PY" \
@@ -154,10 +154,16 @@ def add_meerkat(settings):
     for event, matcher in EVENTS:
         handler = {
             "type": "command",
-            # Exec form: the interpreter is the executable and the script is an
-            # argument, so nothing depends on a shebang, an exec bit, or PATH.
-            "command": python,
-            "args": [hook],
+            # Exec form, so nothing depends on a shebang, an exec bit, PATH or
+            # a shell parsing the paths: Claude Code spawns /bin/sh directly
+            # with these arguments, where $0 is the interpreter and $1 the
+            # script. The one line of sh is there for the failure the script
+            # cannot catch itself -- the script being gone, say after
+            # rm -rf ~/.meerkat without --uninstall. python3 would exit 2 on
+            # the missing file, and exit 2 from a Stop hook keeps Claude from
+            # stopping; this exits 0 instead.
+            "command": "/bin/sh",
+            "args": ["-c", '[ -f "$1" ] || exit 0; exec "$0" "$1"', python, hook],
             # Several of these events block the session until the hook returns.
             # Five seconds is far more than a small file write needs, and it
             # fails open if something ever goes wrong.

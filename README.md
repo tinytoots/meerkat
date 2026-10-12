@@ -23,20 +23,21 @@ task without keeping a window open to check on it.
    │   ▓▓▓▓▓▓▓▓▓▓▓▓░░░░░░░░                   │
    ├──────────────────────────────────────────┤
    │ ✓ docs                       done · 6m   │
-   │   Updated the README.                    │
+   │   Update the README                      │
    ╰──────────────────────────────────────────╯
 ```
 
 The meerkat is drawn, not an emoji: it stands tall and scans while work is
-running, bobs with a `!` over its head when a session is blocked on you, throws
-its arms up and chimes when one finishes, and dozes when everything is quiet.
+running, bobs with a `!` over its head (and pings) when a session is blocked on
+you, throws its arms up and chimes when one finishes, slumps when one fails, and
+dozes when everything is quiet. Right-click → Mute sounds silences both sounds.
 
 ## What it shows, and what it can't
 
 **Per session:** whether it is working, waiting on you, finished (a tick and
 `done`) or failed; how long it has been in that state; the prompt it is working
-on or the line it finished with; and a real progress bar whenever Claude is
-keeping a task list.
+on, or the one it finished; and a real progress bar whenever Claude is keeping a
+task list.
 
 **Plan usage: the same bars as claude.ai.** The current 5-hour session, the
 week across all models, and every model with a weekly limit of its own (Fable,
@@ -49,14 +50,16 @@ one part of Meerkat that touches a credential, and it does so narrowly:
 
 - It reads the token the way Claude Code does, with `/usr/bin/security` from
   the `Claude Code-credentials` item in your login keychain, so macOS does not
-  prompt.
+  ask for permission. A locked keychain is noticed first and skipped, so
+  Meerkat never raises an unlock dialog.
 - The token is read fresh for each request, used for that one request, and
   never logged or written anywhere. `~/.meerkat/usage-api.json` records the
   figures and the outcome of each check, nothing else.
 - Meerkat never refreshes the token. A refresh rotates it, which would sign
   Claude Code out; an expired token just waits for Claude Code to renew it.
 - It looks every 3 minutes, soon after a session finishes a turn, and on wake.
-- Right-click → **Turn off plan usage** stops all of it.
+- Right-click → **Turn off plan usage** hides the bars at once and stops every
+  keychain read and request until you turn it back on.
 
 This works whichever Claude surface you use — terminal, VS Code or the desktop
 app. If the endpoint cannot be reached, Meerkat falls back to figures from a
@@ -94,7 +97,7 @@ tells you which command fixes what it finds.
 | Move it | Drag anywhere that isn't a button |
 | Shrink to just the meerkat | Click the meerkat |
 | Menu (mute, quit, …) | Right-click the window |
-| See the full prompt and path | Hover a row |
+| See the folder, the prompt (its first 110 characters) and counts | Hover a row |
 
 It floats above your other windows, follows you across Spaces, stays out of the
 Dock and the app switcher, and remembers where you left it.
@@ -102,9 +105,8 @@ Dock and the app switcher, and remembers where you left it.
 ### Start it at login
 
 ```bash
-cp build/Meerkat.app /Applications/
-osascript -e 'tell application "System Events" to make login item \
-  at end with properties {path:"/Applications/Meerkat.app", hidden:true}'
+cp -R build/Meerkat.app /Applications/
+osascript -e 'tell application "System Events" to make login item at end with properties {path:"/Applications/Meerkat.app", hidden:true}'
 ```
 
 ## How it works
@@ -125,7 +127,7 @@ Nine lifecycle events drive a small state machine, one JSON file per session:
 |---|---|
 | `SessionStart` | A session appears, idle |
 | `UserPromptSubmit` | It starts working; shows the prompt |
-| `PostToolBatch` | Heartbeat, and clears "needs you" once you've answered |
+| `PostToolBatch` | Heartbeat, and clears "needs you" once the round you approved has run |
 | `Notification` | It's blocked on a permission prompt or a question |
 | `TaskCreated` / `TaskCompleted` | The progress bar |
 | `Stop` | Finished — the bounce and the chime |
@@ -141,8 +143,11 @@ The hook follows three rules, because it runs inside Claude Code's critical
 path: it never writes to stdout (stdout from a `SessionStart` or
 `UserPromptSubmit` hook is injected straight into Claude's context), it always
 exits 0 (exit 2 on `Stop` would stop Claude from stopping), and it does nothing
-slower than a small file write. `scripts/selftest.sh` asserts all three, plus
-the whole state machine, against synthetic events:
+slower than a small file write. `install.sh` registers it through one line of
+`/bin/sh` that exits 0 if the script itself is missing, the one failure the
+script cannot catch. `scripts/selftest.sh` drives the state machine through a
+full lifecycle of synthetic events and checks the stdout and exit-code rules on
+the inputs most likely to break them:
 
 ```bash
 ./scripts/selftest.sh            # the hook, over a full session lifecycle
@@ -160,16 +165,25 @@ that file rather than a reader of it, so keep the two in step by hand.
 
 - **Task counts are event-counted, not read.** If Claude deletes a task, or had
   a task list going before Meerkat was installed, the denominator can be off.
-  It resets on `SessionStart`, and never shows a dishonest ratio like 4/3.
+  It resets when a session starts fresh, is cleared or is forked (a resumed or
+  compacted one keeps counting), and never shows a dishonest ratio like 4/3.
 - **Cloud sessions won't appear.** They don't read your local settings file.
 - **A hook needs workspace trust.** In a folder whose trust dialog you haven't
   accepted, no hooks run at all.
 - **A crashed session can leave a stale row.** Anything not updated for 12 hours
-  is ignored and swept on the next `SessionStart`.
+  is hidden, and its file is deleted by the next `SessionStart` once it is 24
+  hours old.
+- **"Needs you" outlasts your answer.** After you approve a permission prompt
+  the row keeps saying so until that round of tools finishes, because no hook
+  fires in between. A long-running approved command shows as "needs you" for as
+  long as it runs.
 - **The usage endpoint is undocumented.** It is what Claude Code and claude.ai
-  use, but nothing promises its shape. Meerkat parses it defensively: anything
-  it cannot read shows as a reason on the plan-usage line, never a made-up
-  number. `scripts/usage-parse-check.sh` holds the replies it understands.
+  use, but nothing promises its shape. Meerkat parses it defensively: a row it
+  cannot read is left out, never shown as a made-up number, and a failed check
+  keeps the last figures up with their age in amber and the reason in the
+  tooltip. A figure from before its window's reset shows as a dash until a
+  fresh one arrives. `scripts/usage-parse-check.sh` holds the replies it
+  understands.
 - **Plan usage needs a Claude plan sign-in.** An API-key sign-in has no plan
   and so no plan usage. A Claude Code run with `CLAUDE_CONFIG_DIR` keeps its
   sign-in under a different keychain item, which Meerkat does not look for.
@@ -182,18 +196,25 @@ that file rather than a reader of it, so keep the two in step by hand.
 ## Uninstall
 
 ```bash
-./install.sh --uninstall    # restores settings.json exactly as it was
-rm -rf ~/.meerkat           # optional: the state folder
+./scripts/enable-usage.sh --disable   # only if you set up the status line fallback
+./install.sh --uninstall              # removes Meerkat's hooks from settings.json
 ```
 
-`install.sh` backs up `settings.json` with a timestamp before it touches
-anything, and `--dry-run` prints the merged result without writing.
+Then quit Meerkat (right-click → Quit Meerkat), remove its login item and the
+`/Applications` copy if you made them, and, optionally, `rm -rf ~/.meerkat`.
+Quit it first: a running Meerkat recreates the folder.
+
+`--uninstall` removes only Meerkat's own hook entries and leaves everything else
+in `settings.json`, though the file is rewritten (re-indented). `install.sh`
+backs `settings.json` up with a timestamp before any change, and `--dry-run`
+prints the merged result without writing anything.
 
 ## Layout
 
 ```
 hooks/meerkat-hook.py       the state machine (python3, no dependencies)
 hooks/meerkat-statusline.py fallback usage harvester, run as a status line
+Sources/main.swift          app startup
 Sources/Models.swift        Session, Mood, and the plan-usage parsers
 Sources/UsageFetcher.swift  fetches plan usage from claude.ai
 Sources/SessionStore.swift  reads and watches the state files
@@ -208,5 +229,6 @@ scripts/enable-usage.sh     installs the fallback status line harvester
 scripts/selftest.sh         exercises the hook state machine
 scripts/geometry_check.py   checks the drawing stays inside its canvas
 scripts/usage-parse-check.sh checks the plan-usage parsers
+scripts/usage_parse_check.swift  ... with these canned replies
 scripts/demo.sh             fills the widget with fake sessions to look at
 ```

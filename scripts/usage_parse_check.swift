@@ -94,7 +94,8 @@ struct UsageParseCheck {
         expect(fable.title == "Fable this week", "Fable: tooltip title")
     }
 
-    /// A window the server lists as null has not started yet.
+    /// A window the server lists as null has not started yet. A window that is
+    /// there but has no readable figure is left out, never shown as 0%.
     static func unstartedWindow() {
         let reply = json(
             """
@@ -109,6 +110,18 @@ struct UsageParseCheck {
             snapshot.windows.first?.percent == 0 && snapshot.windows.first?.resetsAt == nil,
             "unstarted: null window shows 0% with no reset")
         expect(snapshot.windows.last?.resetsAt == nil, "unstarted: null resets_at is no reset")
+
+        let unreadable = json(
+            """
+            {"five_hour": {"utilization": null, "resets_at": "2026-10-12T04:10:00Z"},
+             "seven_day": {"utilization": "81"},
+             "limits": [{"kind": "weekly_scoped", "scope": {"model": {"display_name": "Fable"}},
+                         "resets_at": 1760274000}],
+             "seven_day_opus": {"utilization": 12}}
+            """)
+        expect(
+            UsageSnapshot(usageAPI: unreadable, captured: now) == nil,
+            "rows with no readable figure are left out, not made 0%; none left is nil")
     }
 
     /// Nothing recognisable must be nil, so the fetcher reports an unexpected

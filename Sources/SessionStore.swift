@@ -96,9 +96,16 @@ final class SessionStore: ObservableObject {
 
     var stateDirectory: URL { directory }
 
-    /// Look at the usage endpoint now, for the menu's refresh and off switch.
+    /// Look at the usage endpoint now, for the menu's refresh.
     func refreshUsage() {
         usageFetcher.refreshNow()
+    }
+
+    /// The menu's switch for plan usage. Off hides the bars from both sources
+    /// at once and stops every keychain read and request.
+    func setPlanUsage(enabled: Bool) {
+        usageFetcher.setDisabled(!enabled)
+        publishUsage()
     }
 
     // MARK: - Watching
@@ -237,7 +244,10 @@ final class SessionStore: ObservableObject {
 
     private func publishUsage() {
         let chosen: UsageSnapshot?
-        if let fetched = fetchedUsage, let harvested = harvestedUsage {
+        if UserDefaults.standard.bool(forKey: UsageFetcher.disabledKey) {
+            // Off means off: no bars from either source.
+            chosen = nil
+        } else if let fetched = fetchedUsage, let harvested = harvestedUsage {
             let fetchedIsFresh = Date().timeIntervalSince(fetched.captured) < fetchedUsageTrustedFor
             chosen = fetchedIsFresh || fetched.captured >= harvested.captured ? fetched : harvested
         } else {
