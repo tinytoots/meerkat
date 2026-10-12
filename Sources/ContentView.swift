@@ -18,12 +18,25 @@ extension Mood {
 
 /// System sounds, held for the life of the process. An NSSound created and
 /// dropped at the call site can be released part-way through playing.
-private enum Chime {
+enum Chime {
     static let finished = NSSound(named: NSSound.Name("Glass"))
     static let needsYou = NSSound(named: NSSound.Name("Tink"))
 
-    static func play(_ sound: NSSound?) {
-        guard let sound = sound else { return }
+    /// Chimes when a session finishes or starts needing you, unless muted.
+    ///
+    /// This follows the store rather than hanging off the view, so the sounds
+    /// do not depend on the window being on screen: a hidden Meerkat is when
+    /// you most need to hear them.
+    static func follow(_ store: SessionStore) -> [AnyCancellable] {
+        [
+            store.$celebratedAt.compactMap { $0 }.sink { _ in play(finished) },
+            store.$alertedAt.compactMap { $0 }.sink { _ in play(needsYou) },
+        ]
+    }
+
+    private static func play(_ sound: NSSound?) {
+        // The same key the menus' Mute sounds toggles.
+        guard let sound = sound, !UserDefaults.standard.bool(forKey: "muted") else { return }
         if sound.isPlaying { sound.stop() }
         sound.play()
     }
@@ -40,6 +53,12 @@ struct ContentView: View {
     /// Nudges the window by a delta. Supplied by the panel controller, because
     /// SwiftUI has no handle on its own NSWindow.
     var moveBy: (CGSize) -> Void = { _ in }
+
+    /// Puts the window away. Also supplied by the panel controller.
+    var hide: () -> Void = {}
+
+    /// Whether the window is on screen, so a hidden one stops animating.
+    var isShown: () -> Bool = { true }
 
     @AppStorage("muted") private var muted = false
     @AppStorage("collapsed") private var collapsed = false
@@ -64,17 +83,20 @@ struct ContentView: View {
                 expandedBody
             }
         }
+        // Pinned to the top, and frosted all the way down, for the moment the
+        // panel is held taller than this after a row goes; see resizeToFit.
+        .frame(maxHeight: .infinity, alignment: .top)
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 16, style: .continuous)
                 .strokeBorder(Color.primary.opacity(0.09), lineWidth: 1)
         )
         .onReceive(ticker) { _ in
+            // Hidden, these redraws would be most of the idle cost, for nobody.
+            guard isShown() else { return }
             phase += 1.0 / 12.0
             now = Date()
         }
-        .onChange(of: store.celebratedAt) { _ in chime(Chime.finished) }
-        .onChange(of: store.alertedAt) { _ in chime(Chime.needsYou) }
         .contextMenu { menu }
     }
 
@@ -118,7 +140,9 @@ struct ContentView: View {
             } else {
                 ForEach(store.sessions) { session in
                     Divider().opacity(0.4)
-                    SessionRow(session: session, now: now, phase: phase)
+                    SessionRow(
+                        session: session, now: now, phase: phase,
+                        onDismiss: { store.dismiss(session) })
                 }
             }
         }
@@ -210,10 +234,25 @@ struct ContentView: View {
                 .help("Click to shrink to just the meerkat")
 
             VStack(alignment: .leading, spacing: 1) {
-                Text("MEERKAT")
-                    .font(.system(size: 10, weight: .semibold))
-                    .tracking(1.4)
-                    .foregroundStyle(.secondary)
+                HStack(spacing: 4) {
+                    Text("MEERKAT")
+                        .font(.system(size: 10, weight: .semibold))
+                        .tracking(1.4)
+                        .foregroundStyle(.secondary)
+                    // Dismissed rows leave a trace, and the way back is a click.
+                    if store.dismissedCount > 0 {
+                        Button {
+                            store.showDismissed()
+                        } label: {
+                            Text("· \(store.dismissedCount) dismissed")
+                                .font(.system(size: 10, weight: .medium))
+                                .foregroundStyle(.tertiary)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Click to show "
+                            + (store.dismissedCount == 1 ? "it" : "them") + " again.")
+                    }
+                }
                 Text(store.headline)
                     .font(.system(size: 12.5, weight: .medium))
                     .foregroundStyle(.primary)
@@ -226,8 +265,10 @@ struct ContentView: View {
         .padding(.bottom, 9)
     }
 
+    /// "Nothing running" would be untrue with a dismissed session still at
+    /// work; the header says how many there are.
     private var emptyState: some View {
-        Text("On watch. Nothing running.")
+        Text(store.dismissedCount > 0 ? "On watch. Nothing new." : "On watch. Nothing running.")
             .font(.system(size: 11.5))
             .foregroundStyle(.secondary)
             .padding(.horizontal, 12)
@@ -248,15 +289,20 @@ struct ContentView: View {
         return min(1, sin(u * Double.pi) * (1 - u) / 0.579)
     }
 
-    private func chime(_ sound: NSSound?) {
-        guard !muted else { return }
-        Chime.play(sound)
+    private var showDismissedTitle: String {
+        let count = store.dismissedCount
+        return count == 1 ? "Show 1 dismissed session" : "Show \(count) dismissed sessions"
     }
 
     @ViewBuilder
     private var menu: some View {
         Button(collapsed ? "Expand" : "Collapse") { collapsed.toggle() }
+        Button("Hide Meerkat") { hide() }
+            .keyboardShortcut(ToggleShortcut.swiftUIKey, modifiers: ToggleShortcut.swiftUIModifiers)
         Button(muted ? "Unmute sounds" : "Mute sounds") { muted.toggle() }
+        if store.dismissedCount > 0 {
+            Button(showDismissedTitle) { store.showDismissed() }
+        }
         Divider()
         if !usageFetchDisabled {
             Button("Refresh plan usage") { store.refreshUsage() }
@@ -274,11 +320,17 @@ struct ContentView: View {
 }
 
 /// One session: a status dot, its name, what it is doing, and progress if it
-/// has published any tasks.
+/// has published any tasks. Hovering it brings up a button that dismisses it.
 struct SessionRow: View {
     let session: Session
     let now: Date
     let phase: Double
+    let onDismiss: () -> Void
+
+    @State private var hovering = false
+
+    /// When the row last appeared or moved on screen; see dismissIfAimed().
+    @State private var movedAt = Date.distantPast
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
@@ -288,10 +340,17 @@ struct SessionRow: View {
                     .font(.system(size: 12.5, weight: .medium))
                     .lineLimit(1)
                 Spacer(minLength: 4)
+                // The × covers the time rather than taking its place, so the
+                // title keeps its width and nothing on the row moves. The
+                // row's tooltip still says how long.
                 Text(trailing)
                     .font(.system(size: 10.5, weight: .medium))
                     .monospacedDigit()
                     .foregroundStyle(.secondary)
+                    .opacity(hovering ? 0 : 1)
+                    .overlay(alignment: .trailing) {
+                        if hovering { dismissButton }
+                    }
             }
 
             Text(session.subtitle)
@@ -308,7 +367,39 @@ struct SessionRow: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .frame(width: MeerkatLayout.width, alignment: .leading)
+        .background(HoverTracker(onHover: { hovering = $0 }, onMove: { movedAt = Date() }))
         .help(tooltip)
+        // The × is there only under the pointer; this works without one.
+        .accessibilityElement(children: .combine)
+        .accessibilityAction(named: Text("Dismiss")) { onDismiss() }
+    }
+
+    /// The ×'s click, unless it may have been meant for something else. A row
+    /// can arrive under a resting pointer -- the one above was dismissed, and
+    /// a double-click's second click would take this one too; a row was added
+    /// or re-sorted above; the window grew -- so a row that has just moved
+    /// waits out a double-click first. And a session can change state where
+    /// it stands, so a state under a second old waits too.
+    private func dismissIfAimed() {
+        let now = Date()
+        guard now.timeIntervalSince(movedAt) > NSEvent.doubleClickInterval,
+              now.timeIntervalSince(session.since) > 1
+        else { return }
+        onDismiss()
+    }
+
+    private var dismissButton: some View {
+        Button(action: dismissIfAimed) {
+            Image(systemName: "xmark.circle.fill")
+                .font(.system(size: 11.5))
+                .foregroundStyle(.secondary)
+                // A target wider than the glyph, reaching left into the gap.
+                .frame(width: 22, height: 14, alignment: .trailing)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("Dismiss. It comes back when this session has something new.")
+        .accessibilityHidden(true)
     }
 
     /// The dot breathes while a session is working, so a busy row is obvious
@@ -373,6 +464,80 @@ struct SessionRow: View {
         if session.turns > 0 { lines.append("turns: \(session.turns)") }
         if !session.detail.isEmpty { lines.append(session.detail) }
         return lines.joined(separator: "\n")
+    }
+}
+
+/// Tells a view whether the pointer is over it, and when it appears or moves
+/// on screen. An AppKit tracking area rather than onHover, because only
+/// `.activeAlways` promises events while another app is active, and Meerkat
+/// never is the active app.
+private struct HoverTracker: NSViewRepresentable {
+    let onHover: (Bool) -> Void
+    let onMove: () -> Void
+
+    func makeNSView(context: Context) -> TrackingView {
+        TrackingView(onHover: onHover, onMove: onMove)
+    }
+
+    func updateNSView(_ view: TrackingView, context: Context) {
+        view.onHover = onHover
+        view.onMove = onMove
+    }
+
+    final class TrackingView: NSView {
+        var onHover: (Bool) -> Void
+        var onMove: () -> Void
+        private var inside = false
+        /// Where the view last was, in screen coordinates.
+        private var place: NSRect?
+
+        init(onHover: @escaping (Bool) -> Void, onMove: @escaping () -> Void) {
+            self.onHover = onHover
+            self.onMove = onMove
+            super.init(frame: .zero)
+            addTrackingArea(
+                NSTrackingArea(
+                    rect: .zero,
+                    options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                    owner: self,
+                    userInfo: nil))
+        }
+
+        required init?(coder: NSCoder) {
+            return nil
+        }
+
+        override func mouseEntered(with event: NSEvent) { report(true) }
+        override func mouseExited(with event: NSEvent) { report(false) }
+
+        /// A tracking area reports the pointer crossing its edge, not the
+        /// area moving under a pointer at rest, as when a row slides up into
+        /// a dismissed row's place. AppKit calls this when the view arrives
+        /// and when its place in the window changes, so note any move on
+        /// screen and look where the pointer is -- once AppKit has finished
+        /// its own update, not in the middle of it.
+        override func updateTrackingAreas() {
+            super.updateTrackingAreas()
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self, let window = self.window else { return }
+                let current = window.convertToScreen(self.convert(self.bounds, to: nil))
+                if current != self.place {
+                    self.place = current
+                    self.onMove()
+                }
+                let pointer = self.convert(window.mouseLocationOutsideOfEventStream, from: nil)
+                self.report(window.isVisible && self.bounds.contains(pointer))
+            }
+        }
+
+        /// A sensor only: every click and drag goes to whatever is in front.
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+        private func report(_ isInside: Bool) {
+            guard isInside != inside else { return }
+            inside = isInside
+            onHover(isInside)
+        }
     }
 }
 

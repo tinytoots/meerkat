@@ -18,6 +18,9 @@ final class SessionStore: ObservableObject {
     /// Set when a session has just started needing you.
     @Published private(set) var alertedAt: Date?
 
+    /// Sessions that would be on the list but for being dismissed.
+    @Published private(set) var dismissedCount = 0
+
     /// The plan-usage figures to show: the usage endpoint's while they are
     /// reasonably fresh, otherwise whatever the status line harvester last
     /// wrote, otherwise nil.
@@ -40,8 +43,13 @@ final class SessionStore: ObservableObject {
     private var timer: Timer?
     private var reloadWorkItem: DispatchWorkItem?
 
-    /// Last known mood per session, for spotting the transitions worth a sound.
-    private var previousMoods: [String: Mood] = [:]
+    /// Each session as last seen, for spotting the transitions worth a sound.
+    private var lastSeen: [String: Session] = [:]
+
+    /// Dismissed rows: session id -> its dismissalMark when it was dismissed.
+    /// Kept in a file beside the session files rather than in UserDefaults,
+    /// so a Meerkat run against another MEERKAT_HOME keeps its own.
+    private var dismissed: [String: String] = [:]
 
     /// A finished session stays on screen this long, so a result does not
     /// vanish before you have looked at it.
@@ -71,6 +79,7 @@ final class SessionStore: ObservableObject {
             self?.applyFetchedUsage(snapshot, status)
         }
         usageFetcher.start()
+        loadDismissed()
         reload()
         startWatching()
         // .common rather than the default mode: a plain scheduledTimer stops
@@ -106,6 +115,22 @@ final class SessionStore: ObservableObject {
     func setPlanUsage(enabled: Bool) {
         usageFetcher.setDisabled(!enabled)
         publishUsage()
+    }
+
+    /// Takes a row off the list until its session has something new to show:
+    /// a new state or a new prompt. Kept across restarts.
+    func dismiss(_ session: Session) {
+        dismissed[session.id] = session.dismissalMark
+        saveDismissed()
+        reload()
+    }
+
+    /// The menu's way back for every dismissed row.
+    func showDismissed() {
+        guard !dismissed.isEmpty else { return }
+        dismissed = [:]
+        saveDismissed()
+        reload()
     }
 
     // MARK: - Watching
@@ -179,6 +204,9 @@ final class SessionStore: ObservableObject {
     private func reload() {
         let now = Date()
         var found: [Session] = []
+        // Every session that still has a file, shown or not, for deciding
+        // which dismissals still hold.
+        var marks: [String: String] = [:]
 
         let names = (try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? []
         for name in names {
@@ -189,6 +217,7 @@ final class SessionStore: ObservableObject {
                   let json = object as? [String: Any],
                   let session = Session(json: json)
             else { continue }
+            marks[session.id] = session.dismissalMark
 
             let age = now.timeIntervalSince(session.updated)
             if age > debrisAfter { continue }
@@ -197,18 +226,38 @@ final class SessionStore: ObservableObject {
             found.append(session)
         }
 
-        // Most recently active first, but anything that wants you goes to the top.
-        found.sort { left, right in
+        // A dismissal lasts until its session moves on or goes away.
+        let stillDismissed = dismissed.filter { marks[$0.key] == $0.value }
+        if stillDismissed != dismissed {
+            dismissed = stillDismissed
+            saveDismissed()
+        }
+
+        // Dismissed sessions included: one dismissed while working comes back
+        // when it finishes, and that only chimes if it was seen working.
+        detectTransitions(in: found)
+
+        var shown = found.filter { dismissed[$0.id] == nil }
+
+        // Anything that wants you goes to the top, then the newest news first:
+        // by when each state began, not by the last event, so a heartbeat
+        // does not shuffle rows, and the × aimed at one row stays on it.
+        shown.sort { left, right in
             if left.mood.urgency != right.mood.urgency {
                 return left.mood.urgency > right.mood.urgency
             }
-            return left.updated > right.updated
+            if left.since != right.since {
+                return left.since > right.since
+            }
+            return left.id < right.id
         }
 
-        detectTransitions(in: found)
-
-        if found != sessions {
-            sessions = found
+        let hidden = found.count - shown.count
+        if hidden != dismissedCount {
+            dismissedCount = hidden
+        }
+        if shown != sessions {
+            sessions = shown
         }
 
         reloadUsage()
@@ -257,25 +306,28 @@ final class SessionStore: ObservableObject {
     }
 
     private func detectTransitions(in found: [Session]) {
-        var nextMoods: [String: Mood] = [:]
+        var next: [String: Session] = [:]
         var justFinished = false
         var justNeedsYou = false
 
         for session in found {
-            nextMoods[session.id] = session.mood
-            let before = previousMoods[session.id]
-            guard let before = before else {
+            next[session.id] = session
+            guard let before = lastSeen[session.id] else {
                 // First sighting. Do not chime for a session that was already
                 // finished when the widget launched.
                 continue
             }
-            if before != session.mood {
+            if before.mood != session.mood {
                 if session.mood == .done { justFinished = true }
                 if session.mood == .attention || session.mood == .failed { justNeedsYou = true }
+            } else if session.mood == .attention && before.since != session.since {
+                // A new request on top of one already waiting: the hook
+                // restamps `since` for each.
+                justNeedsYou = true
             }
         }
 
-        previousMoods = nextMoods
+        lastSeen = next
 
         if justFinished {
             celebratedAt = Date()
@@ -285,16 +337,38 @@ final class SessionStore: ObservableObject {
         if justNeedsYou { alertedAt = Date() }
     }
 
+    // MARK: - Dismissed rows
+
+    private var dismissedFile: URL {
+        directory.deletingLastPathComponent().appendingPathComponent("dismissed.json")
+    }
+
+    private func loadDismissed() {
+        guard let data = try? Data(contentsOf: dismissedFile),
+              let object = try? JSONSerialization.jsonObject(with: data),
+              let marks = object as? [String: String]
+        else { return }
+        dismissed = marks
+    }
+
+    private func saveDismissed() {
+        guard let data = try? JSONSerialization.data(
+            withJSONObject: dismissed, options: [.prettyPrinted, .sortedKeys])
+        else { return }
+        try? data.write(to: dismissedFile, options: .atomic)
+    }
+
     // MARK: - Derived
 
-    /// The mood the header critter wears: whichever session wants you most.
+    /// The mood the header critter wears: whichever session on the list wants
+    /// you most. A dismissed one does not count; dismissing it said you had seen it.
     var headlineMood: Mood {
         sessions.max(by: { $0.mood.urgency < $1.mood.urgency })?.mood ?? .idle
     }
 
     /// A one-line summary for the header, e.g. "2 working · 1 needs you".
     var headline: String {
-        if sessions.isEmpty { return "no sessions" }
+        if sessions.isEmpty { return dismissedCount > 0 ? "nothing new" : "no sessions" }
         var counts: [Mood: Int] = [:]
         for session in sessions { counts[session.mood, default: 0] += 1 }
         let order: [Mood] = [.attention, .failed, .working, .done, .idle]

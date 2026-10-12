@@ -62,6 +62,27 @@ PYEOF
   fi
 }
 
+# field <name> -- print one field of the current state file
+field() {
+  "$PY" - "$MEERKAT_HOME/sessions/$SID.json" "$1" <<'PYEOF'
+import json, sys
+with open(sys.argv[1]) as fh:
+    print(json.load(fh).get(sys.argv[2]))
+PYEOF
+}
+
+# moved <field> <old value> -- assert the field no longer has that value
+moved() {
+  local got
+  got=$(field "$1")
+  if [ "$got" != "$2" ]; then
+    pass=$((pass+1))
+  else
+    fail=$((fail+1))
+    echo "   !! FAIL: $1 is still '$got'"
+  fi
+}
+
 expect_gone() {
   if [ -f "$MEERKAT_HOME/sessions/$SID.json" ]; then
     fail=$((fail+1)); echo "   !! FAIL: state file should have been deleted"
@@ -87,9 +108,19 @@ echo "3. Notification (permission_prompt) -> should grab your attention"
 send "{\"hook_event_name\":\"Notification\",\"session_id\":\"$SID\",\"cwd\":\"$CWD\",\"notification_type\":\"permission_prompt\",\"message\":\"Claude needs your permission to run npm test\"}"
 show; expect state attention; expect waiting_for "needs permission"
 
+echo "3b. A second request while still waiting -> news again: since moves"
+before=$(field since)
+send "{\"hook_event_name\":\"Notification\",\"session_id\":\"$SID\",\"cwd\":\"$CWD\",\"notification_type\":\"elicitation_dialog\",\"message\":\"Claude has a question\"}"
+show; expect state attention; expect waiting_for "needs input"; moved since "$before"
+
 echo "4. PostToolBatch -> permission answered, back to work"
 send "{\"hook_event_name\":\"PostToolBatch\",\"session_id\":\"$SID\",\"cwd\":\"$CWD\"}"
 show; expect state working; expect waiting_for ""
+
+echo "4b. Auto-compaction mid-turn -> still working, since untouched"
+before=$(field since)
+send "{\"hook_event_name\":\"SessionStart\",\"session_id\":\"$SID\",\"cwd\":\"$CWD\",\"source\":\"compact\"}"
+show; expect state working; expect since "$before"
 
 echo "5. Three tasks created, two completed"
 for i in 1 2 3; do send "{\"hook_event_name\":\"TaskCreated\",\"session_id\":\"$SID\",\"cwd\":\"$CWD\"}"; done
@@ -105,6 +136,10 @@ expect detail "Fix the login bug where the session token expires early"
 echo "7. idle_prompt right after finishing -> must NOT flip to attention"
 send "{\"hook_event_name\":\"Notification\",\"session_id\":\"$SID\",\"cwd\":\"$CWD\",\"notification_type\":\"idle_prompt\",\"message\":\"Claude is waiting for your input\"}"
 show; expect state done
+
+echo "7b. /compact once finished -> idle, as before"
+send "{\"hook_event_name\":\"SessionStart\",\"session_id\":\"$SID\",\"cwd\":\"$CWD\",\"source\":\"compact\"}"
+show; expect state idle
 
 echo "8. Second turn, then idle_prompt while working -> attention"
 send "{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"$SID\",\"cwd\":\"$CWD\",\"prompt\":\"now add a regression test\"}"
@@ -142,6 +177,16 @@ if [ -z "$out" ]; then pass=$((pass+1)); else fail=$((fail+1)); echo "   !! FAIL
 echo "15. Path traversal in session_id is neutralised"
 send "{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"../../escape\",\"cwd\":\"$CWD\",\"prompt\":\"x\"}"
 if [ -f "$MEERKAT_HOME/sessions/escape.json" ]; then pass=$((pass+1)); else fail=$((fail+1)); echo "   !! FAIL: expected sessions/escape.json"; fi
+
+echo "16. Context an extension puts into a prompt is not shown; your words are"
+SID="context-1"
+send "{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"$SID\",\"cwd\":\"$CWD\",\"prompt\":\"<browser_instruction># Claude in Chrome browser automation\\n\\nYou have access to browser tools.\\n</browser_instruction>每个任务框是不是得设置一个关闭的东西？\"}"
+show; expect detail "每个任务框是不是得设置一个关闭的东西？"
+send "{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"$SID\",\"cwd\":\"$CWD\",\"prompt\":\"<ide_opened_file>The user opened the file /x/ContentView.swift in the IDE.</ide_opened_file>\\nfix the <b>bold</b> bug <ide_selection>let x = 1</ide_selection>\"}"
+show; expect detail "fix the <b>bold</b> bug"
+send "{\"hook_event_name\":\"Stop\",\"session_id\":\"$SID\",\"cwd\":\"$CWD\"}"
+send "{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"$SID\",\"cwd\":\"$CWD\",\"prompt\":\"<task-notification>\\n<task-id>b1</task-id>\\n<status>completed</status>\\n</task-notification>\"}"
+show; expect state working; expect detail "fix the <b>bold</b> bug"; expect turns 2
 
 echo
 echo "sessions dir now holds:"

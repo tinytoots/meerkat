@@ -21,6 +21,7 @@ State lives in ~/.meerkat/sessions/<session_id>.json (override with $MEERKAT_HOM
 
 import json
 import os
+import re
 import sys
 import time
 
@@ -31,6 +32,17 @@ STATE_VERSION = 1
 STALE_AFTER_SECONDS = 24 * 60 * 60
 
 DETAIL_MAX_CHARS = 110
+
+# Context that something other than you puts into a prompt: Claude in Chrome's
+# instructions, the editor's selection and open file, Claude Code's reminders,
+# and the notice it sends when a background task finishes, which arrives as a
+# prompt of its own. The Chrome block alone runs to thousands of characters,
+# and it comes first, so left in it would be all a row ever showed.
+INJECTED_CONTEXT = re.compile(
+    r"<(browser_instruction|ide_selection|ide_opened_file|system-reminder"
+    r"|task-notification)\b[^>]*>.*?</\1>",
+    re.DOTALL,
+)
 
 
 def home() -> str:
@@ -58,8 +70,10 @@ def tidy(text, limit=DETAIL_MAX_CHARS):
         return ""
     if not isinstance(text, str):
         return ""
-    # Drop the pasted-content markers Claude Code wraps around large pastes,
-    # then flatten to a single line.
+    # Drop injected context whole, wherever it sits, then the pasted-content
+    # markers Claude Code wraps around large pastes, then flatten to a single
+    # line. A newline in a dropped block's place keeps its neighbours apart.
+    text = INJECTED_CONTEXT.sub("\n", text)
     lines = []
     for line in text.splitlines():
         line = line.strip()
@@ -222,15 +236,26 @@ def apply(event, state):
             state["tasks_done"] = 0
             state["turns"] = 0
             state["detail"] = ""
-        state["waiting_for"] = ""
         if event.get("model"):
             state["model"] = event.get("model")
-        moved_to("idle")
+        if source == "compact" and state.get("state") == "working":
+            # Auto-compaction fires this in the middle of a turn, which then
+            # carries on. Calling it idle would be wrong, and would bring back
+            # a row dismissed while it worked.
+            pass
+        else:
+            state["waiting_for"] = ""
+            moved_to("idle")
 
     elif name == "UserPromptSubmit":
-        state["detail"] = tidy(event.get("prompt"))
+        words = tidy(event.get("prompt"))
+        if words:
+            state["detail"] = words
+            state["turns"] = int(state.get("turns") or 0) + 1
+        # Otherwise it was nothing but injected context, like a background
+        # task's notice: not a message from you, so the row keeps your last
+        # prompt and the turn count stays. The session is at work all the same.
         state["waiting_for"] = ""
-        state["turns"] = int(state.get("turns") or 0) + 1
         moved_to("working")
 
     elif name == "PostToolBatch":
@@ -258,7 +283,11 @@ def apply(event, state):
                 "elicitation_url_dialog": "needs sign-in",
             }.get(kind, message or "needs you")
             state["waiting_for"] = pretty
-            moved_to("attention")
+            # Each request is news of its own, even on top of one already
+            # waiting: a fresh `since` is what tells the widget to ping again
+            # and to bring back a row dismissed while the last one waited.
+            state["since"] = now
+            state["state"] = "attention"
 
     elif name == "TaskCreated":
         state["tasks_total"] = int(state.get("tasks_total") or 0) + 1

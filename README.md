@@ -96,11 +96,30 @@ tells you which command fixes what it finds.
 |---|---|
 | Move it | Drag anywhere that isn't a button |
 | Shrink to just the meerkat | Click the meerkat |
-| Menu (mute, quit, …) | Right-click the window |
+| Hide it | ⌃⌘M from anywhere, or right-click → Hide Meerkat |
+| Bring it back | ⌃⌘M from anywhere, click the paw in the menu bar, or open Meerkat again |
+| Menu (mute, quit, …) | Right-click the window, or the paw |
 | See the folder, the prompt (its first 110 characters) and counts | Hover a row |
+| Dismiss a row you are done with | Hover it and click the × over its time. It comes back when that session has news: a message from you, a new request for permission or input, or a change of state |
+| Bring dismissed rows back | Click "N dismissed" beside MEERKAT at the top, or right-click → Show dismissed sessions |
 
 It floats above your other windows, follows you across Spaces, stays out of the
 Dock and the app switcher, and remembers where you left it.
+
+Hidden, it keeps watching. The sounds still play, and the paw in the menu bar
+takes the colour of a session that needs you (orange) or has failed (red),
+unless you have dismissed its row. Every launch starts with the window showing.
+
+⌃⌘M toggles, so the same keys put it away again. While Meerkat runs it takes
+⌃⌘M from other apps' own shortcuts. Another app's system-wide ⌃⌘M fires
+alongside it, unless that app claimed the keys exclusively, which silences
+Meerkat's. If either bites, change it in `Sources/HotKey.swift`. It is a key
+position rather than a letter: on French AZERTY it is the comma key.
+
+On a MacBook with a notch, a crowded menu bar hides whatever does not fit to the
+right of the notch, and a new icon such as the paw is the first to go. If you
+cannot see it, make room -- quit a menu bar app you can do without, or ⌘-drag a
+system icon off the bar -- or simply use ⌃⌘M.
 
 ### Start it at login
 
@@ -125,7 +144,7 @@ Nine lifecycle events drive a small state machine, one JSON file per session:
 
 | Event | What Meerkat does |
 |---|---|
-| `SessionStart` | A session appears, idle |
+| `SessionStart` | A session appears, idle (a compaction mid-turn leaves it working) |
 | `UserPromptSubmit` | It starts working; shows the prompt |
 | `PostToolBatch` | Heartbeat, and clears "needs you" once the round you approved has run |
 | `Notification` | It's blocked on a permission prompt or a question |
@@ -172,7 +191,7 @@ that file rather than a reader of it, so keep the two in step by hand.
   accepted, no hooks run at all.
 - **A crashed session can leave a stale row.** Anything not updated for 12 hours
   is hidden, and its file is deleted by the next `SessionStart` once it is 24
-  hours old.
+  hours old. Dismiss it to be rid of it sooner.
 - **"Needs you" outlasts your answer.** After you approve a permission prompt
   the row keeps saying so until that round of tools finishes, because no hook
   fires in between. A long-running approved command shows as "needs you" for as
@@ -221,6 +240,8 @@ Sources/SessionStore.swift  reads and watches the state files
 Sources/Critter.swift       the meerkat, drawn in a 100x130 design space
 Sources/ContentView.swift   the window content
 Sources/PanelController.swift the floating panel
+Sources/StatusItem.swift    the paw in the menu bar
+Sources/HotKey.swift        the ⌃⌘M shortcut
 install.sh                  merges hooks into ~/.claude/settings.json
 build.sh                    swiftc -> build/Meerkat.app
 scripts/doctor.sh           diagnoses a broken setup

@@ -60,6 +60,17 @@ struct Session: Identifiable, Equatable {
         return mood.word
     }
 
+    /// What the row is showing, as far as dismissing it goes: the state, when
+    /// that state began, and how many messages you have sent the session. A
+    /// dismissed row stays hidden while this holds. A change of state, a new
+    /// message or a new request for permission or input (the hook restamps
+    /// `since` for each) brings it back; an event that changes none of them,
+    /// such as a heartbeat while working, a task ticking over or the idle
+    /// reminder after a finish, does not.
+    var dismissalMark: String {
+        "\(mood.rawValue)@\(since.timeIntervalSince1970)#\(turns)"
+    }
+
     /// Decoded from one of the hook's session JSON files. Returns nil for
     /// anything malformed, so a half-written or future-version file is skipped
     /// rather than crashing the widget.

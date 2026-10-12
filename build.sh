@@ -38,12 +38,15 @@ swiftc -O \
   -target "$(uname -m)-apple-macosx13.0" \
   -framework AppKit \
   -framework SwiftUI \
+  -framework Carbon \
   Sources/Models.swift \
   Sources/UsageFetcher.swift \
   Sources/SessionStore.swift \
   Sources/Critter.swift \
   Sources/ContentView.swift \
   Sources/PanelController.swift \
+  Sources/HotKey.swift \
+  Sources/StatusItem.swift \
   Sources/main.swift \
   -o "$BIN"
 
