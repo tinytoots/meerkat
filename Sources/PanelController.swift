@@ -1,0 +1,214 @@
+import AppKit
+import Combine
+import SwiftUI
+
+/// Owns the floating window: a borderless, non-activating panel that sits above
+/// your other windows on every Space, remembers where you put it, and resizes
+/// itself as sessions come and go.
+final class PanelController {
+
+    private let panel: NSPanel
+    private let store: SessionStore
+    private let hosting: NSHostingView<ContentView>
+    private var cancellables: Set<AnyCancellable> = []
+
+    private static let originKey = "panelOrigin"
+    private static let collapsedKey = "collapsed"
+
+    init(store: SessionStore) {
+        self.store = store
+
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: MeerkatLayout.width, height: 160),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false)
+        self.panel = panel
+
+        // SwiftUI cannot reach its own NSWindow, so hand the collapsed view a
+        // closure that nudges this panel. A drag translation grows downward
+        // while a window origin grows upward, hence the subtraction.
+        hosting = NSHostingView(
+            rootView: ContentView(
+                store: store,
+                moveBy: { [weak panel] delta in
+                    guard let panel = panel else { return }
+                    let frame = panel.frame
+                    panel.setFrameOrigin(
+                        NSPoint(
+                            x: frame.minX + delta.width,
+                            y: frame.minY - delta.height))
+                }))
+        if #available(macOS 13.0, *) {
+            hosting.sizingOptions = [.intrinsicContentSize]
+        }
+
+        configurePanel()
+        observe()
+    }
+
+    private func configurePanel() {
+        panel.isFloatingPanel = true
+        panel.level = .floating
+        panel.becomesKeyOnlyIfNeeded = true
+        panel.hidesOnDeactivate = false
+
+        // Visible on whichever Space you are on, and not dragged along into a
+        // full-screen app's own Space.
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+
+        // The frosted material lives in SwiftUI, so the window itself is glass.
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+
+        // Drag it by any part that is not a control. resizeToFit() turns this
+        // off while collapsed, where the view moves the window itself.
+        panel.isMovableByWindowBackground = true
+
+        panel.contentView = hosting
+    }
+
+    private func observe() {
+        // Resize whenever the session list changes.
+        store.$sessions
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.resizeToFit() }
+            .store(in: &cancellables)
+
+        // ...and when the usage block appears, vanishes or gains a row, which
+        // can happen with no session changing at all.
+        store.$usage
+            .map { $0?.windows.count ?? -1 }
+            .removeDuplicates()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.resizeToFit() }
+            .store(in: &cancellables)
+
+        // Collapsing is a SwiftUI @AppStorage toggle, which lands in
+        // UserDefaults; that is our signal to resize.
+        NotificationCenter.default
+            .publisher(for: UserDefaults.didChangeNotification)
+            .debounce(for: .milliseconds(40), scheduler: DispatchQueue.main)
+            .sink { [weak self] _ in self?.resizeToFit() }
+            .store(in: &cancellables)
+
+        // Remember where you leave it.
+        NotificationCenter.default
+            .publisher(for: NSWindow.didMoveNotification, object: panel)
+            .debounce(for: .milliseconds(250), scheduler: DispatchQueue.main)
+            .sink { [weak self] _ in self?.saveOrigin() }
+            .store(in: &cancellables)
+    }
+
+    func show() {
+        resizeToFit()
+        restoreOrigin()
+        panel.orderFrontRegardless()
+    }
+
+    // MARK: - Geometry
+
+    private var isCollapsed: Bool {
+        UserDefaults.standard.bool(forKey: Self.collapsedKey)
+    }
+
+    /// Ask SwiftUI how tall it wants to be, and fall back to an estimate from
+    /// the row counts if it has not laid out yet.
+    private func resizeToFit() {
+        let collapsed = isCollapsed
+
+        // Keep the two ways of moving the window mutually exclusive. Collapsed,
+        // the critter's tap gesture covers the whole panel and may swallow the
+        // mouse-down that background dragging needs, so SwiftUI moves the window
+        // through `moveBy`. Expanded, AppKit handles it and SwiftUI does not, so
+        // a drag can never be applied twice.
+        panel.isMovableByWindowBackground = !collapsed
+
+        let target: CGSize
+        if collapsed {
+            target = MeerkatLayout.collapsedSize
+        } else {
+            hosting.layoutSubtreeIfNeeded()
+            let fitting = hosting.fittingSize
+            if fitting.height >= 40, fitting.width >= 40 {
+                target = CGSize(width: MeerkatLayout.width, height: ceil(fitting.height))
+            } else {
+                target = CGSize(width: MeerkatLayout.width, height: estimatedHeight())
+            }
+        }
+
+        let current = panel.frame
+        guard abs(current.width - target.width) > 0.5
+            || abs(current.height - target.height) > 0.5
+        else { return }
+
+        // Grow downward: the top-left corner is the one you positioned.
+        let origin = NSPoint(x: current.minX, y: current.maxY - target.height)
+        panel.setFrame(
+            NSRect(origin: origin, size: target), display: true, animate: false)
+        clampOnScreen()
+    }
+
+    private func estimatedHeight() -> CGFloat {
+        var height = MeerkatLayout.headerHeight
+        if let usage = store.usage {
+            height += MeerkatLayout.usageHeaderHeight
+                + CGFloat(usage.windows.count) * MeerkatLayout.usageRowHeight
+        } else {
+            height += MeerkatLayout.footerHeight
+        }
+        if store.sessions.isEmpty {
+            height += MeerkatLayout.emptyStateHeight
+        } else {
+            for session in store.sessions {
+                height += session.hasProgress
+                    ? MeerkatLayout.rowWithProgressHeight
+                    : MeerkatLayout.rowHeight
+            }
+        }
+        return height
+    }
+
+    // MARK: - Position
+
+    private func saveOrigin() {
+        let origin = panel.frame.origin
+        UserDefaults.standard.set(
+            ["x": Double(origin.x), "y": Double(origin.y)], forKey: Self.originKey)
+    }
+
+    private func restoreOrigin() {
+        let saved = UserDefaults.standard.dictionary(forKey: Self.originKey)
+        if let saved = saved,
+           let x = saved["x"] as? Double,
+           let y = saved["y"] as? Double {
+            panel.setFrameOrigin(NSPoint(x: x, y: y))
+        } else if let screen = NSScreen.main {
+            // First launch: top-right, below the menu bar, where a sentry belongs.
+            let visible = screen.visibleFrame
+            panel.setFrameOrigin(
+                NSPoint(
+                    x: visible.maxX - panel.frame.width - 22,
+                    y: visible.maxY - panel.frame.height - 14))
+        }
+        clampOnScreen()
+    }
+
+    /// Keep the window reachable after a display change or an unplugged monitor.
+    private func clampOnScreen() {
+        let frame = panel.frame
+        let screen = NSScreen.screens.first(where: { $0.frame.intersects(frame) })
+            ?? NSScreen.main
+        guard let visible = screen?.visibleFrame else { return }
+
+        var x = frame.minX
+        var y = frame.minY
+        x = min(max(x, visible.minX + 4), visible.maxX - frame.width - 4)
+        y = min(max(y, visible.minY + 4), visible.maxY - frame.height - 4)
+
+        if abs(x - frame.minX) > 0.5 || abs(y - frame.minY) > 0.5 {
+            panel.setFrameOrigin(NSPoint(x: x, y: y))
+        }
+    }
+}
