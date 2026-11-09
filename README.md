@@ -42,7 +42,9 @@ task list.
 **Plan usage: the same bars as claude.ai.** The current 5-hour session, the
 week across all models, and every model with a weekly limit of its own (Fable,
 say), each with its percentage and when it resets — the rows of Settings →
-Usage on claude.ai, because they come from the same place.
+Usage on claude.ai, because they come from the same place. Verified Ultra
+accounts have no 5-hour limit, so the session row stays away unless a window is
+running.
 
 That place is `api.anthropic.com/api/oauth/usage`, the endpoint behind Claude
 Code's own `/usage` screen. It needs your Claude Code sign-in, so this is the
@@ -65,6 +67,14 @@ This works whichever Claude surface you use — terminal, VS Code or the desktop
 app. If the endpoint cannot be reached, Meerkat falls back to figures from a
 terminal status line (`scripts/enable-usage.sh`), which carry the 5-hour and
 weekly bars but not the per-model ones.
+
+## Only Claude Code
+
+Meerkat watches Claude Code and nothing else. Using Codex, Cursor or another
+agent? The window does not depend on Claude Code, only the hook that feeds it
+does, so a fork is a small job your own coding agent can do:
+[docs/other-agents.md](docs/other-agents.md) explains what to change and gives
+a prompt to start it with.
 
 ## Requirements
 
@@ -139,6 +149,10 @@ Claude Code ──hooks──▶ ~/.meerkat/meerkat-hook.py ──▶ ~/.meerkat
 login keychain ──security──▶ token ──▶ GET api.anthropic.com/api/oauth/usage
                                         (every 3 min, after a turn, on wake)
 ```
+
+The app itself knows nothing about Claude Code: it draws whatever the session
+files say. [docs/session-files.md](docs/session-files.md) describes their
+format.
 
 Nine lifecycle events drive a small state machine, one JSON file per session:
 

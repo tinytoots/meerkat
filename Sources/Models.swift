@@ -234,6 +234,11 @@ struct UsageSnapshot: Equatable {
     /// started -- nothing used, no reset scheduled -- and claude.ai shows that
     /// as 0%. Anything else unreadable is left out rather than shown as a
     /// made-up number.
+    ///
+    /// The five-hour window is the exception to the exception. Verified Ultra
+    /// accounts have no such limit and claude.ai shows them no session bar, so
+    /// one with nothing used and no reset is left out. It comes back by itself
+    /// on any plan as soon as a window is running.
     init?(usageAPI json: [String: Any], captured: Date) {
         var found: [UsageWindow] = []
 
@@ -250,6 +255,7 @@ struct UsageSnapshot: Equatable {
             } else {
                 continue
             }
+            if key == "five_hour" && percent == 0 && resets == nil { continue }
             found.append(
                 UsageWindow(
                     id: key, label: UsageWindow.label(for: key), percent: percent,

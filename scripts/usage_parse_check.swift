@@ -94,8 +94,10 @@ struct UsageParseCheck {
         expect(fable.title == "Fable this week", "Fable: tooltip title")
     }
 
-    /// A window the server lists as null has not started yet. A window that is
-    /// there but has no readable figure is left out, never shown as 0%.
+    /// A week the server lists as null has not started yet. A five-hour window
+    /// with nothing used and no reset may not exist at all, as on a verified
+    /// Ultra account, so it gets no row. A window that is there but has no
+    /// readable figure is left out, never shown as 0%.
     static func unstartedWindow() {
         let reply = json(
             """
@@ -105,11 +107,29 @@ struct UsageParseCheck {
             expect(false, "unstarted: parsed to nil")
             return
         }
-        expect(snapshot.windows.map(\.id) == ["five_hour", "seven_day"], "unstarted: both rows kept")
-        expect(
-            snapshot.windows.first?.percent == 0 && snapshot.windows.first?.resetsAt == nil,
-            "unstarted: null window shows 0% with no reset")
+        expect(snapshot.windows.map(\.id) == ["seven_day"], "unstarted: null session has no row")
         expect(snapshot.windows.last?.resetsAt == nil, "unstarted: null resets_at is no reset")
+
+        let idle = json(
+            """
+            {"five_hour": {"utilization": 0, "resets_at": null}, "seven_day": null}
+            """)
+        guard let idleSnapshot = UsageSnapshot(usageAPI: idle, captured: now) else {
+            expect(false, "idle: parsed to nil")
+            return
+        }
+        expect(idleSnapshot.windows.map(\.id) == ["seven_day"], "idle: 0% session with no reset has no row")
+        expect(
+            idleSnapshot.windows.first?.percent == 0 && idleSnapshot.windows.first?.resetsAt == nil,
+            "idle: null week shows 0% with no reset")
+
+        let running = json(
+            """
+            {"five_hour": {"utilization": 0, "resets_at": "2026-10-12T04:10:00Z"}}
+            """)
+        expect(
+            UsageSnapshot(usageAPI: running, captured: now)?.windows.map(\.id) == ["five_hour"],
+            "running: 0% session with a reset keeps its row")
 
         let unreadable = json(
             """
