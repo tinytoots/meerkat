@@ -2,7 +2,7 @@
 
 English | [简体中文](README.zh-CN.md)
 
-https://github.com/user-attachments/assets/b05d4c24-8157-4663-ab87-c5f20fd4a009
+https://github.com/user-attachments/assets/005437ea-5102-41b0-ba09-045e2eb06a35
 
 A small sentry for your Mac desktop. It watches your Claude Code sessions and
 stands up the moment one finishes or needs you, so you can walk away from a long
