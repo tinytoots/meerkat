@@ -2,6 +2,8 @@
 
 [English](README.md) | 简体中文
 
+https://github.com/user-attachments/assets/09cd73ab-8516-4095-8a2f-a179aa4dd5dc
+
 一只蹲在你 Mac 桌面上的小狐獴，专门替你盯着 Claude Code。
 
 Claude Code 跑长任务的时候，不用再一遍遍切回去看：跑完了、要你点确认了，它会站起来叫你。你可以放心走开。
