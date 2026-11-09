@@ -49,7 +49,7 @@ Claude Code 跑长任务的时候，不用再一遍遍切回去看：跑完了�
 
 ## 安装
 
-需要 macOS 13 或更高版本，以及 Xcode 命令行工具（提供 `swiftc` 和 `python3`，不用装完整的 Xcode）：
+需要 macOS 13 或更高版本、较新版本的 Claude Code（在 2.1.296 上测试过，太老的版本可能收不到全部事件），以及 Xcode 命令行工具（提供 `swiftc` 和 `python3`，不用装完整的 Xcode）：
 
 ```bash
 xcode-select --install
@@ -63,6 +63,12 @@ cd meerkat
 ./install.sh                    # 把 hook 接进 Claude Code
 ./build.sh                      # 编译出 Meerkat.app
 open build/Meerkat.app          # 启动
+```
+
+`install.sh` 会让 hook 使用你 PATH 里第一个 `python3`。如果那是 pyenv、conda 或 Homebrew 装的 Python，哪天删了 hook 就会失效。建议改用系统自带的那个：
+
+```bash
+PATH="/usr/bin:$PATH" ./install.sh
 ```
 
 装好后，**新开一个 Claude Code 会话**（已经开着的会话不会读到新的 hook，在里面执行 `/clear` 也行），发一条指令，窗口里就会出现一行。

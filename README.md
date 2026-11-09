@@ -81,16 +81,24 @@ a prompt to start it with.
 ## Requirements
 
 - macOS 13 or later
+- A recent Claude Code (tested with 2.1.296). Older versions may not send all
+  the hook events Meerkat listens for.
 - The Xcode command line tools, for `swiftc` and `python3`:
   `xcode-select --install` (one download, no full Xcode needed)
 
 ## Install
 
 ```bash
+git clone https://github.com/tinytoots/meerkat
+cd meerkat
 ./install.sh                    # wire the hook into Claude Code
 ./build.sh                      # compile Meerkat.app
 open build/Meerkat.app          # start it
 ```
+
+`install.sh` points the hook at the first `python3` on your `PATH`. If that is a
+pyenv, conda or Homebrew Python you might remove one day, use the system one
+instead, so the hook keeps working: `PATH="/usr/bin:$PATH" ./install.sh`.
 
 Then **start a new Claude Code session** — an already-running session does not
 pick up new hooks, though `/clear` in one will do it. Send it a prompt and a row
