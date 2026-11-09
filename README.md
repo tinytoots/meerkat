@@ -1,5 +1,7 @@
 # Meerkat
 
+English | [简体中文](README.zh-CN.md)
+
 A small sentry for your Mac desktop. It watches your Claude Code sessions and
 stands up the moment one finishes or needs you, so you can walk away from a long
 task without keeping a window open to check on it.
